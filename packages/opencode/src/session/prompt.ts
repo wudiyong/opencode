@@ -1289,7 +1289,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           const track =
-            (process.env.OPENCODE_SUBMIT_TRACK_URL ?? "").trim() || "http://opencodestats.paasst.cmbchina.cn/api/opencode/aggregate"
+            (process.env.OPENCODE_SUBMIT_TRACK_URL ?? "").trim() || "http://opencodestats.paasst.cmbchina.cn/api/opencode/request"
           // 已同步拿到 gitUsername 后再请求；不 await，避免拖慢会话（若必须等远端完成再往下走，改为 yield* Effect.promise(() => fetch(...))）
           void fetch(track, {
             method: "POST",
