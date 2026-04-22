@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿usr/bin/env node
 const { execSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -7,7 +7,7 @@ const http = require('http');
 let DatabaseSync;
 try {
   DatabaseSync = require('node:sqlite').DatabaseSync;
-} catch { /* Node 22+ 才有 node:sqlite，加载失败不影响 push */ }
+} catch (e) { diagLog('node:sqlite 加载失败: ' + e.message); diagLog('当前 Node 版本: ' + process.version + ', 路径: ' + process.execPath); }
 
 // ========== Config ==========
 // const BACKEND_URL = 'http://localhost:8090/api/v1/push/report';
@@ -17,6 +17,7 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 const CACHE_DAYS = 10;
 const MAX_PARTS = 500;
+const LOG_ENABLED = false; // 日志统计开关，true：打开关闭日志记录 false： 关闭日志记录
 
 // ========== Utility ==========
 function safeExec(cmd) {
@@ -30,6 +31,20 @@ function toBeijingTime(d = new Date()) {
   const p = (n, w) => String(n).padStart(w, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1, 2)}-${p(d.getDate(), 2)} ` +
     `${p(d.getHours(), 2)}:${p(d.getMinutes(), 2)}:${p(d.getSeconds(), 2)}.${p(d.getMilliseconds(), 3)}`;
+}
+
+const hookDiagLogs = [];
+
+// 将毫秒时间戳转为 yyyy-MM-dd HH:mm:ss 格式
+function formatTimestamp(ms) {
+  if (!ms) return 'null';
+  return toBeijingTime(new Date(ms)).replace(/\.\d{3}$/, '');
+}
+
+// 诊断日志，仅在 LOG_ENABLED 开启时收集
+function diagLog(message) {
+  if (!LOG_ENABLED) return;
+  hookDiagLogs.push(`[${toBeijingTime()}] ${message}`);
 }
 
 function detectPlatform(url) {
@@ -162,14 +177,28 @@ function saveCache(cachePath, lastTimestamp) {
 }
 
 function collectOcParts(repoRoot, cachePath) {
-  if (!DatabaseSync) return [];
+  if (!DatabaseSync) {
+    diagLog('DatabaseSync 不可用 (Node.js 版本 < 22 或当前node [node:sqlite] 保存在问题，请更新node为推荐版本！！！)，跳过 OC 数据采集');
+    return [];
+  }
   const dbPath = findOcDatabase();
-  if (!dbPath) return [];
+  if (!dbPath) {
+    diagLog('未找到 OC 数据库文件，跳过 OC 数据采集');
+    return [];
+  }
 
   const cache = loadCache(cachePath);
   const cutoff = cache && cache.lastSentOcTimestamp
     ? cache.lastSentOcTimestamp
     : Date.now() - CACHE_DAYS * 86400000;
+
+  if (!cache) {
+    diagLog(`缓存读取失败或文件不存在，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
+  } else if (cache.lastSentOcTimestamp) {
+    diagLog(`缓存读取成功，上次上报时间: ${formatTimestamp(cache.lastSentOcTimestamp)}，cutoff: ${formatTimestamp(cutoff)}`);
+  } else {
+    diagLog(`缓存读取成功(无上次上报记录)，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
+  }
 
   // Windows: OC数据库存反斜杠路径，repoRoot可能是正斜杠或反斜杠
   const forwardRoot = repoRoot.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -181,6 +210,7 @@ function collectOcParts(repoRoot, cachePath) {
   let rows;
   try {
     const db = new DatabaseSync(dbPath, { readonly: true });
+    diagLog(`数据库连接成功: ${dbPath}`);
     // 采集含文件变更的 parts ：
     // 1) 有 filediff/filediffs 的（edit工具、write覆盖已有文件）
     // 2) write工具新建文件（无filediff，但有input.content）
@@ -223,13 +253,29 @@ function collectOcParts(repoRoot, cachePath) {
       `OR json_extract(p.data, '$.state.input.command') LIKE '%git rm %')) ` +
       `) ` +
       `ORDER BY p.time_created DESC LIMIT ?`;
+    diagLog(`查询参数 - cutoff: ${cutoff} (${formatTimestamp(cutoff)}), pathPatternFwd: ${pathPatternFwd}, pathPatternBack: ${pathPatternBack}, LIMIT: ${MAX_PARTS}`);
+    diagLog(`SQL查询语句:\n${sql}`);
     rows = db.prepare(sql).all(
       cutoff, pathPatternFwd, pathPatternBack, pathPatternFwd, pathPatternBack,
       pathPatternFwd, pathPatternBack, MAX_PARTS
     );
+    diagLog(`查询完成，结果行数: ${Array.isArray(rows) ? rows.length : 0}`);
+    if (Array.isArray(rows) && rows.length > 0) {
+      rows.forEach((r, i) => {
+        const d = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+        const inp = (d.state && d.state.input) ? d.state.input : {};
+        const meta = (d.state && d.state.metadata) ? d.state.metadata : {};
+        diagLog(`  [${i + 1}] partId: ${r.part_id}, sessionId: ${r.session_id}, tool: ${d.tool || 'unknown'}` +
+          `, filePath: ${inp.filePath || '(null)'}, workdir: ${inp.workdir || '(null)'}` +
+          `, cmd: ${inp.command ? inp.command.substring(0, 100) : '(null)'}` +
+          `, filediff: ${meta.filediff ? 'YES' : 'NO'}, filediffs: ${meta.filediffs ? 'YES' : 'NO'}` +
+          `, timeCreated: ${formatTimestamp(r.time_created)}, sessionDir: ${r.session_dir || '(null)'}`);
+      });
+    }
     db.close();
   } catch (e) {
     console.error('[opencodestats] SQLite read failed:', e.message);
+    diagLog(`数据库连接/查询异常: ${e.message}`);
     return [];
   }
 
@@ -251,13 +297,52 @@ function collectOcParts(repoRoot, cachePath) {
         sessionId: r.session_id,
         sessionTitle: r.session_title || '',
         // 使用 repoRoot 而非 session.directory，因为 OC 可能从不同目录启动 session
-        // 修改本仓库文件，session.directory 不一定等于 repoRoot
+        //       修改本仓库文件，session.directory 不一定等于 repoRoot
         sessionDir: repoRoot,
         toolType,
         timeCreated: r.time_created,
         dataJson,
       };
     });
+}
+
+// ========== 日志记录 ==========
+const RECORD_LOG_PATH = path.join(os.homedir(), 'record_prepush.log');
+
+function writeRecordLog(payload) {
+  if (!LOG_ENABLED) return;
+  try {
+    const content = {
+      diagnosticLogs: hookDiagLogs,
+      payload,
+    };
+    fs.writeFileSync(RECORD_LOG_PATH, JSON.stringify(content, null, 2));
+  } catch (e) {
+    // 日志写入本身失败时，将异常信息写入日志文件
+    try {
+      fs.writeFileSync(RECORD_LOG_PATH, JSON.stringify({
+        timestamp: toBeijingTime(),
+        error: '日志写入异常',
+        message: e.message,
+        diagnosticLogs: hookDiagLogs,
+        payload,
+      }, null, 2));
+    } catch { /* 彻底无法写入，静默忽略 */ }
+  }
+}
+
+function writeErrorLog(error, context) {
+  if (!LOG_ENABLED) return;
+  try {
+    const errorPayload = {
+      timestamp: toBeijingTime(),
+      error: '钩子执行异常',
+      context: context || '',
+      errorMessage: error && error.message ? error.message : String(error),
+      errorStack: error && error.stack ? error.stack : '',
+    };
+    fs.writeFileSync(RECORD_LOG_PATH, JSON.stringify(errorPayload, null, 2));
+  } catch { /* 彻底无法写入，静默忽略 */ }
 }
 
 // ========== HTTP Sending ==========
@@ -331,7 +416,7 @@ async function main() {
 
   const { environment, pushSummary, commitInfos } = collectGitInfo(refs, remoteName, remoteUrl);
   const repoRoot = environment.repoRoot;
-  const cachePath = path.join(repoRoot, '.git', 'hooks', '.opencodestats-cache.json');
+  const cachePath = path.join(os.homedir(), 'opencodestats_cache.json');
   const ocParts = collectOcParts(repoRoot, cachePath);
 
   const payload = {
@@ -342,6 +427,9 @@ async function main() {
     commitInfos,
     ocParts,
   };
+
+  // 将采集到的全部信息写入日志文件（C盘根目录）
+  writeRecordLog(payload);
 
   const ok = await sendReport(payload);
 
@@ -366,10 +454,17 @@ async function main() {
 const HOOK_TIMEOUT = 20000;
 const timer = setTimeout(() => {
   console.error('[opencodestats] hook timed out, force exit');
+  writeErrorLog(new Error('hook timed out'), '超时退出');
   process.exit(0);
 }, HOOK_TIMEOUT);
 timer.unref();
 
 try {
-  main().then(() => process.exit(0)).catch(() => process.exit(0));
-} catch (e) { process.exit(0); }
+  main().then(() => process.exit(0)).catch(e => {
+    writeErrorLog(e, 'main() rejected');
+    process.exit(0);
+  });
+} catch (e) {
+  writeErrorLog(e, 'main() 同步异常');
+  process.exit(0);
+}
