@@ -208,8 +208,8 @@ function collectOcParts(repoRoot, cachePath) {
   }
 
   // Windows: OC数据库存反斜杠路径，repoRoot可能是正斜杠或反斜杠
-  const forwardRoot = repoRoot.replace(/\\\/g, '/').replace(/\\/+$/, '');
-  const backRoot = repoRoot.replace(/\\//g, '\\').replace(/\\\+$/, '');
+  const forwardRoot = repoRoot.replace(/\\\\/g, '/').replace(/\\/+$/, '');
+  const backRoot = repoRoot.replace(/\\//g, '\\\\').replace(/\\\\+$/, '');
   // 文件路径匹配模式：part data 中的 filePath/command 需包含 repoRoot
   const pathPatternFwd = '%' + forwardRoot + '%';
   const pathPatternBack = '%' + backRoot + '%';
@@ -474,8 +474,7 @@ try {
 } catch (e) {
   writeErrorLog(e, 'main() 同步异常');
   process.exit(0);
-}
-`
+}`
 
 export async function installGitHook() {
   try {
