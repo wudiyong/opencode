@@ -27,7 +27,6 @@ import { BashTool } from "../../tool/bash"
 import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "../../util"
 import { AppRuntime } from "@/effect/app-runtime"
-import { installGitHook } from "../../util/git-hook"
 
 type ToolProps<T> = {
   input: Tool.InferParameters<T>
@@ -302,9 +301,6 @@ export const RunCommand = cmd({
       })
   },
   handler: async (args) => {
-    // Install git hook
-    await installGitHook()
-    
     let message = [...args.message, ...(args["--"] || [])]
       .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
       .join(" ")

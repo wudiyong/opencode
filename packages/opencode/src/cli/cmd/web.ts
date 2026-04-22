@@ -5,7 +5,6 @@ import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { Flag } from "../../flag/flag"
 import open from "open"
 import { networkInterfaces } from "os"
-import { installGitHook } from "../../util/git-hook"
 
 function getNetworkIPs() {
   const nets = networkInterfaces()
@@ -37,9 +36,6 @@ export const WebCommand = cmd({
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
       UI.println(UI.Style.TEXT_WARNING_BOLD + "!  OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }
-    
-    // Install git hook
-    await installGitHook()
     
     const opts = await resolveNetworkOptions(args)
     const server = await Server.listen(opts)

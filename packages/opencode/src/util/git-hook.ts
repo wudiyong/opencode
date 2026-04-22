@@ -5,7 +5,7 @@ import * as Process from "./process"
 import * as Log from "./log"
 
 // Pre-push hook content embedded directly in the code
-const prePushContent = `usr/bin/env node
+const prePushContent = `#!/usr/bin/env node
 const { execSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
