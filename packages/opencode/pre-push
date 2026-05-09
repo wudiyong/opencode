@@ -16,8 +16,8 @@ const HTTP_TIMEOUT = 3000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 const CACHE_DAYS = 10;
-const MAX_PARTS = 500;
-const LOG_ENABLED = false; // 日志统计开关，true：打开关闭日志记录 false： 关闭日志记录
+const MAX_PARTS = 300;
+const LOG_ENABLED = true; // 日志统计开关，true：打开关闭日志记录 false： 关闭日志记录
 
 // ========== Utility ==========
 function safeExec(cmd) {
@@ -152,31 +152,33 @@ function findOcDatabase() {
   return null;
 }
 
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 6;
 
+// 缓存格式: { version: 6, remotes: { "远端URL": 时间戳, ... } }
+// 每个远端仓库独立推进时间戳，互不干扰
 function loadCache(cachePath) {
   try {
     if (!fs.existsSync(cachePath)) return null;
     const data = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     if (!data.version || data.version < CACHE_VERSION) {
-      return { version: CACHE_VERSION, lastSentOcTimestamp: null };
+      return { version: CACHE_VERSION, remotes: {} };
     }
     return data;
   } catch { return null; }
 }
 
-function saveCache(cachePath, lastTimestamp) {
+function saveCache(cachePath, remoteUrl, lastTimestamp) {
   try {
+    const cache = loadCache(cachePath) || { version: CACHE_VERSION, remotes: {} };
+    cache.version = CACHE_VERSION;
+    cache.remotes[remoteUrl] = lastTimestamp;
     const tmp = cachePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({
-      version: CACHE_VERSION,
-      lastSentOcTimestamp: lastTimestamp,
-    }));
+    fs.writeFileSync(tmp, JSON.stringify(cache));
     fs.renameSync(tmp, cachePath);
   } catch { /* silent */ }
 }
 
-function collectOcParts(repoRoot, cachePath) {
+function collectOcParts(repoRoot, cachePath, remoteUrl) {
   if (!DatabaseSync) {
     diagLog('DatabaseSync 不可用 (Node.js 版本 < 22 或当前node [node:sqlite] 保存在问题，请更新node为推荐版本！！！)，跳过 OC 数据采集');
     return [];
@@ -188,22 +190,23 @@ function collectOcParts(repoRoot, cachePath) {
   }
 
   const cache = loadCache(cachePath);
-  const cutoff = cache && cache.lastSentOcTimestamp
-    ? cache.lastSentOcTimestamp
+  const normalizedUrl = remoteUrl.replace(/\/+$/, '');
+  const repoTs = cache && cache.remotes && cache.remotes[normalizedUrl];
+  const cutoff = repoTs
+    ? repoTs
     : Date.now() - CACHE_DAYS * 86400000;
 
   if (!cache) {
     diagLog(`缓存读取失败或文件不存在，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
-  } else if (cache.lastSentOcTimestamp) {
-    diagLog(`缓存读取成功，上次上报时间: ${formatTimestamp(cache.lastSentOcTimestamp)}，cutoff: ${formatTimestamp(cutoff)}`);
+  } else if (repoTs) {
+    diagLog(`缓存读取成功(${normalizedUrl})，上次上报时间: ${formatTimestamp(repoTs)}，cutoff: ${formatTimestamp(cutoff)}`);
   } else {
-    diagLog(`缓存读取成功(无上次上报记录)，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
+    diagLog(`缓存读取成功(${normalizedUrl}，无上次上报记录)，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
   }
 
-  // Windows: OC数据库存反斜杠路径，repoRoot可能是正斜杠或反斜杠
+  // 路径匹配模式：正斜杠和反斜杠两种
   const forwardRoot = repoRoot.replace(/\\/g, '/').replace(/\/+$/, '');
   const backRoot = repoRoot.replace(/\//g, '\\').replace(/\\+$/, '');
-  // 文件路径匹配模式：part data 中的 filePath/command 需包含 repoRoot
   const pathPatternFwd = '%' + forwardRoot + '%';
   const pathPatternBack = '%' + backRoot + '%';
 
@@ -211,25 +214,19 @@ function collectOcParts(repoRoot, cachePath) {
   try {
     const db = new DatabaseSync(dbPath, { readonly: true });
     diagLog(`数据库连接成功: ${dbPath}`);
-    // 采集含文件变更的 parts ：
+    // 采集含文件变更的 parts（按仓库路径过滤，只提交属于当前仓库的）：
     // 1) 有 filediff/filediffs 的（edit工具、write覆盖已有文件）
     // 2) write工具新建文件（无filediff，但有input.content）
     // 3) bash工具删除文件（Remove-Item/rm/del 等命令）
-    // 过滤掉 read/glob/grep/text/reasoning 等无文件变更的 parts
-    // 注意：不使用 session.directory 过滤，因为 OC 可能从不同目录启动 session
-    //       修改本仓库文件。改用 part data 中的文件路径匹配 repoRoot。
-    // 注意：bash删除命令（git rm/rm/Remove-Item等）使用相对路径时，
-    //       filePath/command/workdir 都不含 repoRoot，因此单独作为条件。
+    // 路径隔离通过 SQL LIKE 匹配 input.filePath / input.workdir / input.command 实现
     const sql = `SELECT p.id as part_id, p.session_id, p.time_created, p.data, ` +
       `s.title as session_title, s.directory as session_dir ` +
       `FROM part p LEFT JOIN session s ON p.session_id = s.id ` +
       `WHERE p.time_created > ? ` +
       `AND (` +
-      // 条件1: 有路径匹配（edit/write等非bash工具的文件变更）
+      // 条件1: 有路径匹配的文件变更 parts（edit/write等非bash工具）
       `((json_extract(p.data, '$.state.input.filePath') LIKE ? ` +
       `OR json_extract(p.data, '$.state.input.filePath') LIKE ? ` +
-      `OR json_extract(p.data, '$.state.input.command') LIKE ? ` +
-      `OR json_extract(p.data, '$.state.input.command') LIKE ? ` +
       `OR json_extract(p.data, '$.state.input.workdir') LIKE ? ` +
       `OR json_extract(p.data, '$.state.input.workdir') LIKE ?) ` +
       `AND (json_extract(p.data, '$.state.metadata.filediff') IS NOT NULL ` +
@@ -240,11 +237,13 @@ function collectOcParts(repoRoot, cachePath) {
       `AND json_extract(p.data, '$.state.metadata.filediff') IS NULL ` +
       `AND json_extract(p.data, '$.state.metadata.filediffs') IS NULL))) ` +
       `OR ` +
-      // 条件2: bash删除命令（无需路径匹配，git rm/rm/Remove-Item等命令本身就在仓库中操作）
+      // 条件2: bash删除命令（路径在command中，也需要匹配仓库路径）
       `(json_extract(p.data, '$.type') = 'tool' ` +
       `AND json_extract(p.data, '$.tool') = 'bash' ` +
       `AND json_extract(p.data, '$.state.status') = 'completed' ` +
       `AND json_extract(p.data, '$.state.input.command') IS NOT NULL ` +
+      `AND (COALESCE(json_extract(p.data, '$.state.input.workdir'), s.directory) LIKE ? ` +
+      `OR COALESCE(json_extract(p.data, '$.state.input.workdir'), s.directory) LIKE ?) ` +
       `AND (json_extract(p.data, '$.state.input.command') LIKE '%Remove-Item%' ` +
       `OR json_extract(p.data, '$.state.input.command') LIKE 'rm %' ` +
       `OR json_extract(p.data, '$.state.input.command') LIKE 'rm\t%' ` +
@@ -257,7 +256,8 @@ function collectOcParts(repoRoot, cachePath) {
     diagLog(`SQL查询语句:\n${sql}`);
     rows = db.prepare(sql).all(
       cutoff, pathPatternFwd, pathPatternBack, pathPatternFwd, pathPatternBack,
-      pathPatternFwd, pathPatternBack, MAX_PARTS
+      pathPatternFwd, pathPatternBack,
+      MAX_PARTS
     );
     diagLog(`查询完成，结果行数: ${Array.isArray(rows) ? rows.length : 0}`);
     if (Array.isArray(rows) && rows.length > 0) {
@@ -296,8 +296,7 @@ function collectOcParts(repoRoot, cachePath) {
         partId: r.part_id,
         sessionId: r.session_id,
         sessionTitle: r.session_title || '',
-        // 使用 repoRoot 而非 session.directory，因为 OC 可能从不同目录启动 session
-        //       修改本仓库文件，session.directory 不一定等于 repoRoot
+        // 使用 repoRoot 保证 oc_part.repo_path 与 push_record.repo_path 一致
         sessionDir: repoRoot,
         toolType,
         timeCreated: r.time_created,
@@ -305,6 +304,194 @@ function collectOcParts(repoRoot, cachePath) {
       };
     });
 }
+
+function collectClaudeCode(repoRoot, cachePath, remoteUrl) {
+  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  if (!fs.existsSync(claudeProjectsDir)) {
+    diagLog('未找到 Claude projects 目录，跳过 Claude 数据采集');
+    return [];
+  }
+
+  const cache = loadCache(cachePath);
+  const normalizedUrl = remoteUrl.replace(/\/+$/, '');
+  const repoTs = cache && cache.remotes && cache.remotes[normalizedUrl];
+  const cutoff = repoTs
+    ? repoTs
+    : Date.now() - CACHE_DAYS * 86400000;
+
+  if (!cache) {
+    diagLog(`缓存读取失败或文件不存在，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
+  } else if (repoTs) {
+    diagLog(`缓存读取成功(${normalizedUrl})，上次上报时间: ${formatTimestamp(repoTs)}，cutoff: ${formatTimestamp(cutoff)}`);
+  } else {
+    diagLog(`缓存读取成功(${normalizedUrl}，无上次上报记录)，使用默认 ${CACHE_DAYS} 天窗口，cutoff: ${formatTimestamp(cutoff)}`);
+  }
+
+  // \、/、:、.、_ 都替换为 -
+  const projectDirName = repoRoot.replace(/[\\/:._]/g, '-');
+  const projectDir = path.join(claudeProjectsDir, projectDirName);
+
+  if (!fs.existsSync(projectDir)) {
+    diagLog(`未找到项目目录: ${projectDir}，跳过 Claude 数据采集`);
+    return [];
+  }
+
+  let jsonlFiles;
+  try {
+    jsonlFiles = fs.readdirSync(projectDir)
+      .filter(file => file.endsWith('.jsonl'))
+      .map(file => ({
+        name: file,
+        path: path.join(projectDir, file),
+        mtime: fs.statSync(path.join(projectDir, file)).mtime.getTime()
+      }))
+      .filter(file => file.mtime > cutoff);
+  } catch (e) {
+    diagLog(`读取项目目录失败: ${e.message}`);
+    return [];
+  }
+
+  if (jsonlFiles.length === 0) {
+    diagLog('没有需要处理的 jsonl 文件');
+    return [];
+  }
+
+  diagLog(`找到 ${jsonlFiles.length} 个需要处理的 jsonl 文件`);
+
+  const results = [];
+
+  for (const fileInfo of jsonlFiles) {
+    let content;
+    try {
+      content = fs.readFileSync(fileInfo.path, 'utf8');
+    } catch (e) {
+      diagLog(`读取文件失败: ${fileInfo.path}, 错误: ${e.message}`);
+      continue;
+    }
+
+    const jsonLines = parseJsonlContent(content);
+    for (const line of jsonLines) {
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      const timestamp = record.timestamp;
+      if (!timestamp) continue;
+
+      const timeCreated = timestampToLong(timestamp);
+      if (timeCreated <= cutoff) continue;
+
+      const toolType = detectToolType(record);
+      if (!toolType) continue;
+
+      const uuid = record.uuid;
+      const sessionId = record.sessionId;
+
+      if (!uuid || !sessionId) continue;
+
+      results.push({
+        uuid: uuid,
+        sessionId: sessionId,
+        sessionDir: repoRoot,
+        toolType: toolType,
+        timeCreated: timeCreated,
+        dataJson: line
+      });
+    }
+  }
+
+  results.sort((a, b) => a.timeCreated - b.timeCreated);
+
+  diagLog(`Claude 数据采集完成，共 ${results.length} 条记录`);
+
+  return results;
+}
+
+function parseJsonlContent(content) {
+  const lines = [];
+  let braceDepth = 0;
+  let currentObj = '';
+  
+  for (const char of content) {
+    if (char === '{' && !isInsideString(currentObj)) {
+      braceDepth++;
+    } else if (char === '}' && !isInsideString(currentObj)) {
+      braceDepth--;
+    }
+    
+    currentObj += char;
+    
+    if (braceDepth === 0 && currentObj.trim()) {
+      lines.push(currentObj.trim());
+      currentObj = '';
+    }
+  }
+  
+  return lines;
+}
+
+function isInsideString(str) {
+  let inString = false;
+  let escape = false;
+  
+  for (const char of str) {
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (char === '\\') {
+      escape = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+    }
+  }
+  
+  return inString;
+}
+
+function timestampToLong(timestamp) {
+  const date = new Date(timestamp);
+  return date.getTime();
+}
+
+function detectToolType(record) {
+  if (record.toolUseResult) {
+    const toolUseResult = record.toolUseResult;
+    if (toolUseResult.structuredPatch && toolUseResult.structuredPatch.length > 0) {
+      const hasLines = toolUseResult.structuredPatch.some(patch => 
+        patch.lines && patch.lines.length > 0
+      );
+      if (hasLines) {
+        return 'edit';
+      }
+    }
+    if (toolUseResult.type === 'create' && toolUseResult.content) {
+      return 'write';
+    }
+  }
+
+  if (record.message && record.message.content) {
+    for (const content of record.message.content) {
+      if (content.type === 'tool_use' && content.name === 'Bash' && content.input && content.input.command) {
+        const command = content.input.command.trim();
+        if (command.startsWith('rm ') && !command.startsWith('rm -rf')) {
+          return 'delete';
+        }
+        if (command.startsWith('mv ')) {
+          return 'rename';
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 
 // ========== 日志记录 ==========
 const RECORD_LOG_PATH = path.join(os.homedir(), 'record_prepush.log');
@@ -417,7 +604,9 @@ async function main() {
   const { environment, pushSummary, commitInfos } = collectGitInfo(refs, remoteName, remoteUrl);
   const repoRoot = environment.repoRoot;
   const cachePath = path.join(os.homedir(), 'opencodestats_cache.json');
-  const ocParts = collectOcParts(repoRoot, cachePath);
+  const claudeCodeCachePath = path.join(os.homedir(), 'claude_code_cache.json');
+  const ocParts = collectOcParts(repoRoot, cachePath, remoteUrl);
+  const claudeCodeParts = collectClaudeCode(repoRoot, claudeCodeCachePath, remoteUrl);
 
   const payload = {
     timestamp: toBeijingTime(),
@@ -426,6 +615,7 @@ async function main() {
     pushSummary,
     commitInfos,
     ocParts,
+    claudeCodeParts,
   };
 
   // 将采集到的全部信息写入日志文件（C盘根目录）
@@ -433,14 +623,18 @@ async function main() {
 
   const ok = await sendReport(payload);
 
-  // Update cache only on success
-  if (ok && ocParts.length > 0) {
-    const maxTs = Math.max(...ocParts.map(p => p.timeCreated));
-    const cache = loadCache(cachePath);
-    const lastTs = cache && cache.lastSentOcTimestamp
-      ? Math.max(cache.lastSentOcTimestamp, maxTs)
-      : maxTs;
-    saveCache(cachePath, lastTs);
+  // Update cache only on success (per-remote timestamp)
+  if (ok) {
+    if (ocParts.length > 0) {
+      const maxTs = Math.max(...ocParts.map(p => p.timeCreated));
+      const normalizedUrl = remoteUrl.replace(/\/+$/, '');
+      saveCache(cachePath, normalizedUrl, maxTs);
+    }
+    if (claudeCodeParts.length > 0) {
+      const maxTs = Math.max(...claudeCodeParts.map(p => p.timeCreated));
+      const normalizedUrl = remoteUrl.replace(/\/+$/, '');
+      saveCache(claudeCodeCachePath, normalizedUrl, maxTs);
+    }
   }
 
   // Save local log
